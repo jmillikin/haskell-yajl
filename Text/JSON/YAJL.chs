@@ -168,47 +168,47 @@ getBuffer gen =
 
 {# fun yajl_gen_null as generateNull
 	{ withGenerator* `Generator'
-	} -> `()' checkStatus* #}
+	} -> `()' checkGenStatus* #}
 
 {# fun yajl_gen_bool as generateBoolean
 	{ withGenerator* `Generator'
 	, `Bool'
-	} -> `()' checkStatus* #}
+	} -> `()' checkGenStatus* #}
 
 generateNumber :: Num a => Generator -> a -> IO ()
 generateNumber gen num =
 	withGenerator gen $ \handle ->
 	withCStringLen (show num) $ \(cstr, len) ->
 	{# call yajl_gen_number #} handle (castPtr cstr) (fromIntegral len)
-	>>= checkStatus
+	>>= checkGenStatus
 
 generateText :: Generator -> T.Text -> IO ()
 generateText gen text =
 	withGenerator gen $ \handle ->
 	B.useAsCStringLen (TE.encodeUtf8 text) $ \(cstr, len) ->
 	{# call yajl_gen_string #} handle (castPtr cstr) (fromIntegral len)
-	>>= checkStatus
+	>>= checkGenStatus
 
 {# fun yajl_gen_array_open as generateBeginArray
 	{ withGenerator* `Generator'
-	} -> `()' checkStatus* #}
+	} -> `()' checkGenStatus* #}
 
 {# fun yajl_gen_array_close as generateEndArray
 	{ withGenerator* `Generator'
-	} -> `()' checkStatus* #}
+	} -> `()' checkGenStatus* #}
 
 {# fun yajl_gen_map_open as generateBeginObject
 	{ withGenerator* `Generator'
-	} -> `()' checkStatus* #}
+	} -> `()' checkGenStatus* #}
 
 {# fun yajl_gen_map_close as generateEndObject
 	{ withGenerator* `Generator'
-	} -> `()' checkStatus* #}
+	} -> `()' checkGenStatus* #}
 
 {# enum yajl_gen_status as GenStatus {underscoreToCase} #}
 
-checkStatus :: CInt -> IO ()
-checkStatus int = case toEnum $ fromIntegral int of
+checkGenStatus :: CInt -> IO ()
+checkGenStatus int = case toEnum $ fromIntegral int of
 	YajlGenStatusOk -> return ()
 	YajlGenKeysMustBeStrings -> E.throwIO InvalidAttributeName
 	YajlMaxDepthExceeded -> E.throwIO MaximumDepthExceeded
