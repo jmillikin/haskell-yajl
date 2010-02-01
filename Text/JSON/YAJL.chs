@@ -14,6 +14,7 @@
 -- along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 {-# LANGUAGE ForeignFunctionInterface #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 module Text.JSON.YAJL
 	(
 	-- * Parser
@@ -30,7 +31,7 @@ module Text.JSON.YAJL
 	, GeneratorConfig (..)
 	, newGenerator
 	, getBuffer
-	, clear
+	, clearBuffer
 	
 	-- ** Generator events
 	, generateNull
@@ -42,8 +43,17 @@ module Text.JSON.YAJL
 	, generateBeginObject
 	, generateEndObject
 	) where
-import Data.ByteString (ByteString)
-import Data.Text (Text)
+import qualified Control.Exception as E
+import qualified Data.ByteString as B
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import Data.Typeable (Typeable)
+
+-- import unqualified for C2Hs
+import Foreign
+import Foreign.C
+
+#include <yajl/yajl_gen.h>
 
 data Parser = Parser
 
@@ -52,21 +62,21 @@ data ParserCallbacks = ParserCallbacks
 	, parsedBoolean :: Bool -> IO ()
 	, parsedInteger :: Integer -> IO ()
 	-- TODO: fractional numbers?
-	, parsedText :: Text -> IO ()
+	, parsedText :: T.Text -> IO ()
 	, parsedBeginArray :: IO ()
 	, parsedEndArray :: IO ()
 	, parsedBeginObject :: IO ()
-	, parsedAttributeName :: Text -> IO ()
+	, parsedAttributeName :: T.Text -> IO ()
 	, parsedEndObject :: IO ()
 	}
 
 newParser :: ParserCallbacks -> IO Parser
 newParser = undefined
 
-parse :: Parser -> ByteString -> IO ()
+parse :: Parser -> B.ByteString -> IO ()
 parse = undefined
 
-parseText :: Parser -> Text -> IO ()
+parseText :: Parser -> T.Text -> IO ()
 parseText = undefined
 
 parseComplete :: Parser -> IO ()
@@ -76,41 +86,126 @@ getBytesConsumed :: Parser -> IO Integer
 getBytesConsumed = undefined
 
 data Generator = Generator
+	{ genHandle :: ForeignPtr GenHandle
+	, genIndent :: ForeignPtr CChar
+	}
 
 data GeneratorConfig = GeneratorConfig
 	{ generatorBeautify :: Bool
-	, generatorIndent :: Maybe Text
+	, generatorIndent :: T.Text
 	}
 
+data GeneratorError
+	= InvalidAttributeName
+	| MaximumDepthExceeded
+	| GeneratorInErrorState
+	| GenerationComplete
+	| InvalidNumber
+	| NoBuffer
+	deriving (Show, Eq, Typeable)
+
+instance E.Exception GeneratorError
+
+{# pointer yajl_gen as GenHandle newtype #}
+{# pointer *yajl_gen_config as GenConfig newtype #}
+
 newGenerator :: GeneratorConfig -> IO Generator
-newGenerator = undefined
+newGenerator config = allocaBytes {# sizeof yajl_gen_config #} $ \cConfig -> do
+	cIndent <- marshalText $ generatorIndent config
+	
+	{# set yajl_gen_config->beautify #} cConfig 0
+	withForeignPtr cIndent $ {# set yajl_gen_config->indentString #} cConfig
+	
+	GenHandle handlePtr <- cGenAlloc (GenConfig cConfig) nullPtr
+	handleFP <- newForeignPtr cGenFree handlePtr
+	return $ Generator handleFP cIndent
 
-getBuffer :: Generator -> IO ByteString
-getBuffer = undefined
+marshalText :: T.Text -> IO (ForeignPtr CChar)
+marshalText text =
+	B.useAsCStringLen (TE.encodeUtf8 text) $ \(temp, len) ->
+	mallocForeignPtrBytes (len + 1) >>= \fp ->
+	withForeignPtr fp $ \array -> do
+		copyArray array temp len
+		poke (advancePtr array len) 0
+		return fp
 
-clear :: Generator -> IO ()
-clear = undefined
+{# fun yajl_gen_alloc as cGenAlloc
+	{ id `GenConfig'
+	, id `Ptr ()'
+	} -> `GenHandle' id #}
 
-generateNull :: Generator -> IO ()
-generateNull = undefined
+foreign import ccall "yajl/yajl_gen.h &yajl_gen_free"
+	cGenFree :: FunPtr (Ptr GenHandle -> IO ())
 
-generateBoolean :: Generator -> Bool -> IO ()
-generateBoolean = undefined
+withGenerator :: Generator -> (GenHandle -> IO a) -> IO a
+withGenerator gen io = withForeignPtr (genHandle gen) $ io . GenHandle
+
+getBuffer :: Generator -> IO B.ByteString
+getBuffer gen =
+	withGenerator gen $ \handle ->
+	alloca $ \bufPtr ->
+	alloca $ \lenPtr -> do
+	{# call yajl_gen_get_buf #} handle bufPtr lenPtr
+	buf <- peek bufPtr
+	len <- peek lenPtr
+	-- TODO: check that len is < (maxBound :: Int)
+	B.packCStringLen (castPtr buf, fromIntegral len)
+
+{# fun yajl_gen_clear as clearBuffer
+	{ withGenerator* `Generator'
+	} -> `()' id #}
+
+{# fun yajl_gen_null as generateNull
+	{ withGenerator* `Generator'
+	} -> `()' checkStatus* #}
+
+{# fun yajl_gen_bool as generateBoolean
+	{ withGenerator* `Generator'
+	, `Bool'
+	} -> `()' checkStatus* #}
 
 generateNumber :: Num a => Generator -> a -> IO ()
-generateNumber = undefined
+generateNumber gen num =
+	withGenerator gen $ \handle ->
+	withCStringLen (show num) $ \(cstr, len) ->
+	{# call yajl_gen_number #} handle (castPtr cstr) (fromIntegral len)
+	>>= checkStatus
 
-generateText :: Generator -> Text -> IO ()
-generateText = undefined
+generateText :: Generator -> T.Text -> IO ()
+generateText gen text =
+	withGenerator gen $ \handle ->
+	B.useAsCStringLen (TE.encodeUtf8 text) $ \(cstr, len) ->
+	{# call yajl_gen_string #} handle (castPtr cstr) (fromIntegral len)
+	>>= checkStatus
 
-generateBeginArray :: Generator -> IO ()
-generateBeginArray = undefined
+{# fun yajl_gen_array_open as generateBeginArray
+	{ withGenerator* `Generator'
+	} -> `()' checkStatus* #}
 
-generateEndArray :: Generator -> IO ()
-generateEndArray = undefined
+{# fun yajl_gen_array_close as generateEndArray
+	{ withGenerator* `Generator'
+	} -> `()' checkStatus* #}
 
-generateBeginObject :: Generator -> IO ()
-generateBeginObject = undefined
+{# fun yajl_gen_map_open as generateBeginObject
+	{ withGenerator* `Generator'
+	} -> `()' checkStatus* #}
 
-generateEndObject :: Generator -> IO ()
-generateEndObject = undefined
+{# fun yajl_gen_map_close as generateEndObject
+	{ withGenerator* `Generator'
+	} -> `()' checkStatus* #}
+
+{# enum yajl_gen_status as GenStatus {underscoreToCase} #}
+
+checkStatus :: CInt -> IO ()
+checkStatus int = case toEnum $ fromIntegral int of
+	YajlGenStatusOk -> return ()
+	YajlGenKeysMustBeStrings -> E.throwIO InvalidAttributeName
+	YajlMaxDepthExceeded -> E.throwIO MaximumDepthExceeded
+	YajlGenInErrorState -> E.throwIO GeneratorInErrorState
+	YajlGenGenerationComplete -> E.throwIO GenerationComplete
+	YajlGenInvalidNumber -> E.throwIO InvalidNumber
+	YajlGenNoBuf -> E.throwIO NoBuffer
+
+cFromBool :: Bool -> CInt
+cFromBool True = 1
+cFromBool False = 0
