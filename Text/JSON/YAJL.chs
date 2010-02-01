@@ -92,7 +92,11 @@ data Generator = Generator
 
 data GeneratorConfig = GeneratorConfig
 	{ generatorBeautify :: Bool
+	-- ^ Whether to generate indented, whitespaced output.
+	
 	, generatorIndent :: T.Text
+	-- ^ How much to indent beautified output by. This is only used
+	-- if 'generatorBeautify' is 'True'.
 	}
 
 data GeneratorError
@@ -109,6 +113,8 @@ instance E.Exception GeneratorError
 {# pointer yajl_gen as GenHandle newtype #}
 {# pointer *yajl_gen_config as GenConfig newtype #}
 
+-- | Create a new, empty generator with the given configuration.
+-- 
 newGenerator :: GeneratorConfig -> IO Generator
 newGenerator config = allocaBytes {# sizeof yajl_gen_config #} $ \cConfig -> do
 	cIndent <- marshalText $ generatorIndent config
@@ -140,6 +146,8 @@ foreign import ccall "yajl/yajl_gen.h &yajl_gen_free"
 withGenerator :: Generator -> (GenHandle -> IO a) -> IO a
 withGenerator gen io = withForeignPtr (genHandle gen) $ io . GenHandle
 
+-- | Retrieve the @NUL@-terminated generator buffer.
+-- 
 getBuffer :: Generator -> IO B.ByteString
 getBuffer gen =
 	withGenerator gen $ \handle ->
@@ -151,6 +159,9 @@ getBuffer gen =
 	-- TODO: check that len is < (maxBound :: Int)
 	B.packCStringLen (castPtr buf, fromIntegral len)
 
+-- | Clear the generator's output buffer. This does not change the state
+-- of the generator.
+-- 
 {# fun yajl_gen_clear as clearBuffer
 	{ withGenerator* `Generator'
 	} -> `()' id #}
