@@ -21,7 +21,7 @@ module Text.JSON.YAJL
 	  Parser
 	, ParserCallbacks (..)
 	, newParser
-	, parse
+	, parseUTF8
 	, parseText
 	, parseComplete
 	, getBytesConsumed
@@ -53,37 +53,96 @@ import Data.Typeable (Typeable)
 import Foreign
 import Foreign.C
 
+#include <yajl/yajl_parse.h>
 #include <yajl/yajl_gen.h>
 
 data Parser = Parser
-
-data ParserCallbacks = ParserCallbacks
-	{ parsedNull :: IO ()
-	, parsedBoolean :: Bool -> IO ()
-	, parsedInteger :: Integer -> IO ()
-	-- TODO: fractional numbers?
-	, parsedText :: T.Text -> IO ()
-	, parsedBeginArray :: IO ()
-	, parsedEndArray :: IO ()
-	, parsedBeginObject :: IO ()
-	, parsedAttributeName :: T.Text -> IO ()
-	, parsedEndObject :: IO ()
+	{ parserHandle :: ForeignPtr ParserHandle
+	, parserCallbacks :: ForeignPtr ()
 	}
 
+-- | Each callback should return 'True' to continue parsing, or 'False'
+-- to cancel.
+--
+data ParserCallbacks = ParserCallbacks
+	{ parsedNull :: IO Bool
+	, parsedBoolean :: Bool -> IO Bool
+	, parsedInteger :: Integer -> IO Bool
+	-- TODO: fractional numbers?
+	, parsedText :: T.Text -> IO Bool
+	, parsedBeginArray :: IO Bool
+	, parsedEndArray :: IO Bool
+	, parsedBeginObject :: IO Bool
+	, parsedAttributeName :: T.Text -> IO Bool
+	, parsedEndObject :: IO Bool
+	}
+
+{# pointer yajl_handle as ParserHandle newtype #}
+
 newParser :: ParserCallbacks -> IO Parser
-newParser = undefined
+newParser callbacks = do
+	cCallbacks <- mallocForeignPtrBytes {# sizeof yajl_callbacks #}
+	withForeignPtr cCallbacks $ \raw -> do
+		-- TODO
+		{# set yajl_callbacks->yajl_null #} raw nullFunPtr
+		{# set yajl_callbacks->yajl_boolean #} raw nullFunPtr
+		{# set yajl_callbacks->yajl_integer #} raw nullFunPtr
+		{# set yajl_callbacks->yajl_double #} raw nullFunPtr
+		{# set yajl_callbacks->yajl_number #} raw nullFunPtr
+		{# set yajl_callbacks->yajl_string #} raw nullFunPtr
+		{# set yajl_callbacks->yajl_start_map #} raw nullFunPtr
+		{# set yajl_callbacks->yajl_map_key #} raw nullFunPtr
+		{# set yajl_callbacks->yajl_end_map #} raw nullFunPtr
+		{# set yajl_callbacks->yajl_start_array #} raw nullFunPtr
+		{# set yajl_callbacks->yajl_end_array #} raw nullFunPtr
+	
+	-- TODO
+	
+	ParserHandle handlePtr <- withForeignPtr cCallbacks $ \ptr ->
+		{# call yajl_alloc #} ptr nullPtr nullPtr nullPtr
+	parserFP <- newForeignPtr cParserFree handlePtr
+	return $ Parser parserFP cCallbacks
 
-parse :: Parser -> B.ByteString -> IO ()
-parse = undefined
+foreign import ccall "yajl/yajl_parse.h &yajl_free"
+	cParserFree :: FunPtr (Ptr ParserHandle -> IO ())
 
-parseText :: Parser -> T.Text -> IO ()
-parseText = undefined
+withParser :: Parser -> (ParserHandle -> IO a) -> IO a
+withParser p io = withForeignPtr (parserHandle p) $ io . ParserHandle
 
-parseComplete :: Parser -> IO ()
-parseComplete = undefined
+parseUTF8 :: Parser -> B.ByteString -> IO ParseStatus
+parseUTF8 p bytes =
+	withParser p $ \handle ->
+	B.useAsCStringLen bytes $ \(cstr, len) ->
+	{# call yajl_parse #} handle (castPtr cstr) (fromIntegral len)
+	>>= checkParseStatus
 
-getBytesConsumed :: Parser -> IO Integer
-getBytesConsumed = undefined
+{# fun yajl_parse as parseText
+	{ withParser* `Parser'
+	, withUtf8* `T.Text'&
+	} -> `ParseStatus' checkParseStatus* #}
+
+{# fun yajl_parse_complete as parseComplete
+	{ withParser* `Parser'
+	} -> `ParseStatus' checkParseStatus* #}
+
+{# fun yajl_get_bytes_consumed as getBytesConsumed
+	{ withParser* `Parser'
+	} -> `Integer' toInteger #}
+
+{# enum yajl_status as RawParseStatus {underscoreToCase} #}
+
+data ParseStatus
+	= ParseContinue
+	| ParseFinished
+	| ParseCancelled
+	deriving (Show, Eq)
+
+checkParseStatus :: CInt -> IO ParseStatus
+checkParseStatus int = case toEnum $ fromIntegral int of
+	YajlStatusOk -> return ParseFinished
+	YajlStatusClientCanceled -> return ParseCancelled
+	YajlStatusInsufficientData -> return ParseContinue
+	YajlStatusError -> E.throwIO $ E.ErrorCall "TODO"
 
 data Generator = Generator
 	{ genHandle :: ForeignPtr GenHandle
@@ -182,12 +241,10 @@ generateNumber gen num =
 	{# call yajl_gen_number #} handle (castPtr cstr) (fromIntegral len)
 	>>= checkGenStatus
 
-generateText :: Generator -> T.Text -> IO ()
-generateText gen text =
-	withGenerator gen $ \handle ->
-	B.useAsCStringLen (TE.encodeUtf8 text) $ \(cstr, len) ->
-	{# call yajl_gen_string #} handle (castPtr cstr) (fromIntegral len)
-	>>= checkGenStatus
+{# fun yajl_gen_string as generateText
+	{ withGenerator* `Generator'
+	, withUtf8* `T.Text'&
+	} -> `()' checkGenStatus* #}
 
 {# fun yajl_gen_array_open as generateBeginArray
 	{ withGenerator* `Generator'
@@ -220,3 +277,8 @@ checkGenStatus int = case toEnum $ fromIntegral int of
 cFromBool :: Bool -> CInt
 cFromBool True = 1
 cFromBool False = 0
+
+withUtf8 :: T.Text -> ((Ptr CUChar, CUInt) -> IO a) -> IO a
+withUtf8 text io =
+	B.useAsCStringLen (TE.encodeUtf8 text) $ \(cstr, len) ->
+	io (castPtr cstr, fromIntegral len)
