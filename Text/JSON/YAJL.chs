@@ -50,6 +50,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Typeable (Typeable)
 import qualified Foreign.Concurrent as FC
+import qualified Data.IORef as I
 
 -- import unqualified for C2Hs
 import Foreign
@@ -61,6 +62,7 @@ import Foreign.C
 data Parser = Parser
 	{ parserHandle :: ForeignPtr ParserHandle
 	, parserCallbacks :: ForeignPtr ()
+	, parserErrorRef :: I.IORef (Maybe E.SomeException)
 	}
 
 -- | Each callback should return 'True' to continue parsing, or 'False'
@@ -83,25 +85,26 @@ data ParserCallbacks = ParserCallbacks
 
 newParser :: ParserCallbacks -> IO Parser
 newParser callbacks = do
+	ref <- I.newIORef Nothing
 	cCallbacks <- mallocForeignPtrBytes {# sizeof yajl_callbacks #}
 	withForeignPtr cCallbacks $ \raw -> do
-		wrapCallback0 (parsedNull callbacks)
+		wrapCallback0 ref (parsedNull callbacks)
 			>>= {# set yajl_callbacks->yajl_null #} raw
-		wrapCallbackBool (parsedBoolean callbacks)
+		wrapCallbackBool ref (parsedBoolean callbacks)
 			>>= {# set yajl_callbacks->yajl_boolean #} raw
-		wrapCallbackInt (parsedInteger callbacks)
+		wrapCallbackInt ref (parsedInteger callbacks)
 			>>= {# set yajl_callbacks->yajl_number #} raw
-		wrapCallbackText (parsedText callbacks)
+		wrapCallbackText ref (parsedText callbacks)
 			>>= {# set yajl_callbacks->yajl_string #} raw
-		wrapCallback0 (parsedBeginObject callbacks)
+		wrapCallback0 ref (parsedBeginObject callbacks)
 			>>= {# set yajl_callbacks->yajl_start_map #} raw
-		wrapCallbackText (parsedAttributeName callbacks)
+		wrapCallbackText ref (parsedAttributeName callbacks)
 			>>= {# set yajl_callbacks->yajl_map_key #} raw
-		wrapCallback0 (parsedEndObject callbacks)
+		wrapCallback0 ref (parsedEndObject callbacks)
 			>>= {# set yajl_callbacks->yajl_end_map #} raw
-		wrapCallback0 (parsedBeginArray callbacks)
+		wrapCallback0 ref (parsedBeginArray callbacks)
 			>>= {# set yajl_callbacks->yajl_start_array #} raw
-		wrapCallback0 (parsedEndArray callbacks)
+		wrapCallback0 ref (parsedEndArray callbacks)
 			>>= {# set yajl_callbacks->yajl_end_array #} raw
 		
 		-- Unused
@@ -113,7 +116,7 @@ newParser callbacks = do
 	ParserHandle handlePtr <- withForeignPtr cCallbacks $ \ptr ->
 		{# call yajl_alloc #} ptr nullPtr nullPtr nullPtr
 	parserFP <- newForeignPtr cParserFree handlePtr
-	return $ Parser parserFP cCallbacks
+	return $ Parser parserFP cCallbacks ref
 
 freeParserCallbacks :: Ptr () -> IO ()
 freeParserCallbacks raw = do
@@ -136,22 +139,29 @@ type CallbackBool = Ptr () -> CInt -> IO CInt
 type CallbackInt = Ptr () -> Ptr CChar -> CUInt -> IO CInt
 type CallbackText = Ptr () -> Ptr CUChar -> CUInt -> IO CInt
 
-wrapCallback0 :: IO Bool -> IO (FunPtr Callback0)
-wrapCallback0 io = allocCallback0 $ \_ -> fmap cFromBool io
+catchRef :: I.IORef (Maybe E.SomeException) -> IO Bool -> IO CInt
+catchRef ref io = do
+	continue <- E.catch io $ \e -> do
+		I.writeIORef ref $ Just e
+		return False
+	return $ cFromBool continue
 
-wrapCallbackBool :: (Bool -> IO Bool) -> IO (FunPtr CallbackBool)
-wrapCallbackBool io = allocCallbackBool $ \_ x -> cFromBool `fmap` io (cToBool x)
+wrapCallback0 :: I.IORef (Maybe E.SomeException) -> IO Bool -> IO (FunPtr Callback0)
+wrapCallback0 ref io = allocCallback0 $ \_ -> catchRef ref io
 
-wrapCallbackInt :: (Integer -> IO Bool) -> IO (FunPtr CallbackInt)
-wrapCallbackInt io = allocCallbackInt $ \_ cstr len -> do
+wrapCallbackBool :: I.IORef (Maybe E.SomeException) -> (Bool -> IO Bool) -> IO (FunPtr CallbackBool)
+wrapCallbackBool ref io = allocCallbackBool $ \_ -> catchRef ref . io . cToBool
+
+wrapCallbackInt :: I.IORef (Maybe E.SomeException) -> (Integer -> IO Bool) -> IO (FunPtr CallbackInt)
+wrapCallbackInt ref io = allocCallbackInt $ \_ cstr len -> catchRef ref $ do
 	str <- peekCStringLen (cstr, fromIntegral len)
 	-- TODO: support fractions
-	cFromBool `fmap` io (read str)
+	io (read str)
 
-wrapCallbackText :: (T.Text -> IO Bool) -> IO (FunPtr CallbackText)
-wrapCallbackText io = allocCallbackText $ \_ cstr len -> do
+wrapCallbackText :: I.IORef (Maybe E.SomeException) -> (T.Text -> IO Bool) -> IO (FunPtr CallbackText)
+wrapCallbackText ref io = allocCallbackText $ \_ cstr len -> catchRef ref $ do
 	bytes <- B.packCStringLen (castPtr cstr, fromIntegral len)
-	cFromBool `fmap` io (TE.decodeUtf8 bytes)
+	io (TE.decodeUtf8 bytes)
 
 foreign import ccall "wrapper"
 	allocCallback0 :: Callback0 -> IO (FunPtr Callback0)
@@ -204,7 +214,13 @@ data ParseStatus
 checkParseStatus :: Parser -> CInt -> IO ParseStatus
 checkParseStatus p int = case toEnum $ fromIntegral int of
 	YajlStatusOk -> return ParseFinished
-	YajlStatusClientCanceled -> return ParseCancelled
+	YajlStatusClientCanceled -> do
+		threw <- I.readIORef $ parserErrorRef p
+		case threw of
+			Nothing -> return ParseCancelled
+			Just exc -> do
+				I.writeIORef (parserErrorRef p) Nothing
+				E.throwIO exc
 	YajlStatusInsufficientData -> return ParseContinue
 	YajlStatusError -> ParseError `fmap` getParseError p
 
