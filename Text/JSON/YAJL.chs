@@ -37,6 +37,8 @@ module Text.JSON.YAJL
 	-- ** Generator events
 	, generateNull
 	, generateBoolean
+	, generateIntegral
+	, generateDouble
 	, generateNumber
 	, generateText
 	, generateBeginArray
@@ -46,14 +48,13 @@ module Text.JSON.YAJL
 	) where
 import qualified Control.Exception as E
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Unsafe as BU
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Typeable (Typeable)
 import qualified Foreign.Concurrent as FC
 import qualified Data.IORef as I
-import qualified Data.Ratio as R
-import Data.Ratio ((%))
 
 -- import unqualified for C2Hs
 import Foreign
@@ -74,7 +75,7 @@ data Parser = Parser
 data ParserCallbacks = ParserCallbacks
 	{ parsedNull :: IO Bool
 	, parsedBoolean :: Bool -> IO Bool
-	, parsedNumber :: Rational -> IO Bool
+	, parsedNumber :: B.ByteString -> IO Bool
 	, parsedText :: T.Text -> IO Bool
 	, parsedBeginArray :: IO Bool
 	, parsedEndArray :: IO Bool
@@ -154,10 +155,9 @@ wrapCallback0 ref io = allocCallback0 $ \_ -> catchRef ref io
 wrapCallbackBool :: I.IORef (Maybe E.SomeException) -> (Bool -> IO Bool) -> IO (FunPtr CallbackBool)
 wrapCallbackBool ref io = allocCallbackBool $ \_ -> catchRef ref . io . cToBool
 
-wrapCallbackNum :: I.IORef (Maybe E.SomeException) -> (Rational -> IO Bool) -> IO (FunPtr CallbackNum)
-wrapCallbackNum ref io = allocCallbackNum $ \_ cstr len -> catchRef ref $ do
-	bytes <- B.packCStringLen (cstr, fromIntegral len)
-	io $ readNumber bytes
+wrapCallbackNum :: I.IORef (Maybe E.SomeException) -> (B.ByteString -> IO Bool) -> IO (FunPtr CallbackNum)
+wrapCallbackNum ref io = allocCallbackNum $ \_ cstr len -> catchRef ref $
+	B.packCStringLen (cstr, fromIntegral len) >>= io
 
 wrapCallbackText :: I.IORef (Maybe E.SomeException) -> (T.Text -> IO Bool) -> IO (FunPtr CallbackText)
 wrapCallbackText ref io = allocCallbackText $ \_ cstr len -> catchRef ref $ do
@@ -321,10 +321,16 @@ getBuffer gen =
 	, `Bool'
 	} -> `()' checkGenStatus* #}
 
-generateNumber :: Real a => Generator -> a -> IO ()
-generateNumber gen num =
+generateIntegral :: Integral a => Generator -> a -> IO ()
+generateIntegral gen = generateNumber gen . showBytes . toInteger
+
+generateDouble :: Generator -> Double -> IO ()
+generateDouble gen = generateNumber gen . showBytes
+
+generateNumber :: Generator -> B.ByteString -> IO ()
+generateNumber gen bytes =
 	withGenerator gen $ \handle ->
-	withCStringLen (showNumber (toRational num)) $ \(cstr, len) ->
+	BU.unsafeUseAsCStringLen bytes $ \(cstr, len) ->
 	{# call yajl_gen_number #} handle (castPtr cstr) (fromIntegral len)
 	>>= checkGenStatus
 
@@ -375,39 +381,5 @@ withUtf8 text io =
 	B.useAsCStringLen (TE.encodeUtf8 text) $ \(cstr, len) ->
 	io (castPtr cstr, fromIntegral len)
 
-showNumber :: Rational -> String
--- TODO: format with full precision, unless the decimal expansion is infinite
-showNumber num = show (fromRational num :: Double)
-
-readNumber :: B.ByteString -> Rational
-readNumber bytes = number where
-	-- YAJL has already parsed the string and decided it's valid, so not
-	-- much validation is performed here.
-	
-	invalid = error $ "readNumber: invalid"
-	just (Just x) = x
-	just _ = invalid
-	
-	number = ((int % 1) + fraction) * exp'
-	
-	(int, notInt) = just $ BC.readInteger bytes
-	
-	(fraction, notFrac) = case BC.uncons notInt of
-		Just ('.', fracBytes) -> readFraction fracBytes
-		_ -> (0, notInt)
-	
-	exp' = case BC.uncons notFrac of
-		Nothing -> 1
-		Just ('e', bytes') -> readExponent bytes'
-		Just ('E', bytes') -> readExponent bytes'
-		_ -> invalid
-	
-	readFraction bytes' = (raw % fracDenom, pastFrac) where
-		(raw, pastFrac) = just $ BC.readInteger bytes'
-		fracDenom = 10 ^ toInteger (B.length bytes' - B.length pastFrac)
-	
-	readExponent bytes' = case BC.readInteger bytes' of
-		Just (raw, notExp) -> if B.null notExp
-			then 10 ^^ raw
-			else invalid
-		_ -> invalid
+showBytes :: Show a => a -> B.ByteString
+showBytes = BC.pack . show
