@@ -161,7 +161,7 @@ wrapCallbackNum ref io = allocCallbackNum $ \_ cstr len -> catchRef ref $
 
 wrapCallbackText :: I.IORef (Maybe E.SomeException) -> (T.Text -> IO Bool) -> IO (FunPtr CallbackText)
 wrapCallbackText ref io = allocCallbackText $ \_ cstr len -> catchRef ref $ do
-	bytes <- B.packCStringLen (castPtr cstr, fromIntegral len)
+	bytes <- BU.unsafePackCStringLen (castPtr cstr, fromIntegral len)
 	io (TE.decodeUtf8 bytes)
 
 foreign import ccall "wrapper"
@@ -182,7 +182,7 @@ withParser p io = withForeignPtr (parserHandle p) $ io . ParserHandle
 parseUTF8 :: Parser -> B.ByteString -> IO ParseStatus
 parseUTF8 p bytes =
 	withParser p $ \handle ->
-	B.useAsCStringLen bytes $ \(cstr, len) ->
+	BU.unsafeUseAsCStringLen bytes $ \(cstr, len) ->
 	{# call yajl_parse #} handle (castPtr cstr) (fromIntegral len)
 	>>= checkParseStatus p
 
@@ -274,7 +274,7 @@ newGenerator config = allocaBytes {# sizeof yajl_gen_config #} $ \cConfig -> do
 
 marshalText :: T.Text -> IO (ForeignPtr CChar)
 marshalText text =
-	B.useAsCStringLen (TE.encodeUtf8 text) $ \(temp, len) ->
+	BU.unsafeUseAsCStringLen (TE.encodeUtf8 text) $ \(temp, len) ->
 	mallocForeignPtrBytes (len + 1) >>= \fp ->
 	withForeignPtr fp $ \array -> do
 		copyArray array temp len
@@ -378,7 +378,8 @@ cToBool x = error $ "cToBool " ++ show x
 
 withUtf8 :: T.Text -> ((Ptr CUChar, CUInt) -> IO a) -> IO a
 withUtf8 text io =
-	B.useAsCStringLen (TE.encodeUtf8 text) $ \(cstr, len) ->
+	let bytes = TE.encodeUtf8 text in
+	BU.unsafeUseAsCStringLen bytes $ \(cstr, len) ->
 	io (castPtr cstr, fromIntegral len)
 
 showBytes :: Show a => a -> B.ByteString
