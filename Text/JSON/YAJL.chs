@@ -30,6 +30,7 @@ module Text.JSON.YAJL
 	-- * Generator
 	, Generator
 	, GeneratorConfig (..)
+	, GeneratorError (..)
 	, newGenerator
 	, getBuffer
 	, clearBuffer
@@ -83,6 +84,20 @@ data ParserCallbacks = ParserCallbacks
 	, parsedAttributeName :: T.Text -> IO Bool
 	, parsedEndObject :: IO Bool
 	}
+
+data ParseStatus
+	= ParseFinished
+	| ParseContinue
+	-- ^ More input is required before parsing can complete.
+	
+	| ParseCancelled
+	-- ^ A callback returned 'False'.
+	
+	| ParseError T.Text
+	-- ^ An error occured while parsing. The included message contains
+	-- details about the error.
+	
+	deriving (Show, Eq)
 
 {# pointer yajl_handle as ParserHandle newtype #}
 
@@ -193,24 +208,32 @@ parseText p text =
 	{# call yajl_parse #} handle utf8 len
 	>>= checkParseStatus p
 
+-- | Indicate that no more input is available, and parse any remaining
+-- buffered input.
+-- 
 parseComplete :: Parser -> IO ParseStatus
 parseComplete p =
 	withParser p $ \handle ->
 	{# call yajl_parse_complete #} handle
 	>>= checkParseStatus p
 
+-- | Get the number of bytes consumed from the last input chunk.
+-- 
+-- Note that if using 'parseText', this corresponds to UTF-8 bytes,
+-- /not/ characters.
+-- 
+-- If the most recent call to 'parseUTF8' or 'parseText' returned
+-- 'ParseFinished', this will indicate whether there are any un-parsed
+-- bytes past the end of input.
+-- 
+-- If the most recent parse returned 'ParseError', this will indicate where
+-- the error occured.
+-- 
 {# fun yajl_get_bytes_consumed as getBytesConsumed
 	{ withParser* `Parser'
 	} -> `Integer' toInteger #}
 
 {# enum yajl_status as RawParseStatus {underscoreToCase} #}
-
-data ParseStatus
-	= ParseContinue
-	| ParseFinished
-	| ParseCancelled
-	| ParseError T.Text
-	deriving (Show, Eq)
 
 checkParseStatus :: Parser -> CInt -> IO ParseStatus
 checkParseStatus p int = case toEnum $ fromIntegral int of
@@ -245,6 +268,12 @@ data GeneratorConfig = GeneratorConfig
 	-- if 'generatorBeautify' is 'True'.
 	}
 
+-- | If an error is encountered when generating data, a 'GeneratorError'
+-- will be thrown.
+-- 
+-- With the exception of 'MaximumDepthExceeded', this is usually due to
+-- incorrect use of the library.
+-- 
 data GeneratorError
 	= InvalidAttributeName
 	| MaximumDepthExceeded
@@ -292,7 +321,7 @@ foreign import ccall "yajl/yajl_gen.h &yajl_gen_free"
 withGenerator :: Generator -> (GenHandle -> IO a) -> IO a
 withGenerator gen io = withForeignPtr (genHandle gen) $ io . GenHandle
 
--- | Retrieve the @NUL@-terminated generator buffer.
+-- | Retrieve the @NUL@-terminated byte buffer.
 -- 
 getBuffer :: Generator -> IO B.ByteString
 getBuffer gen =
