@@ -7,7 +7,7 @@ author: John Millikin
 maintainer: jmillikin@gmail.com
 copyright: Copyright (c) John Millikin 2010
 build-type: Simple
-cabal-version: >=1.4
+cabal-version: >=1.6
 category: Foreign, Codec
 stability: experimental
 homepage: http://ianen.org/haskell/bindings/yajl/
