@@ -217,6 +217,7 @@ parse' :: Parser s -> (ParserHandle -> IO CInt) -> ST.ST s ParseStatus
 parse' p io = do
 	ST.writeSTRef (parserErrorRef p) Nothing
 	rc <- blockST $ withParser p io
+	ST.unsafeIOToST $ touchForeignPtr $ parserCallbacks p
 	case rc of
 		0 -> return ParseFinished
 		1 -> do
@@ -252,7 +253,6 @@ getParseError p = withParser p $ \h -> E.bracket
 
 data Generator s = Generator
 	{ genHandle :: ForeignPtr GenHandle
-	, genIndent :: ForeignPtr CChar
 	}
 
 data GeneratorConfig = GeneratorConfig
@@ -296,8 +296,9 @@ newGenerator config = ST.unsafeIOToST $
 		withForeignPtr cIndent $ {# set yajl_gen_config->indentString #} cConfig
 	
 		GenHandle handlePtr <- cGenAlloc (GenConfig cConfig) nullPtr
+		touchForeignPtr cIndent
 		handleFP <- newForeignPtr cGenFree handlePtr
-		return $ Generator handleFP cIndent
+		return $ Generator handleFP
 
 marshalText :: T.Text -> IO (ForeignPtr CChar)
 marshalText text =
