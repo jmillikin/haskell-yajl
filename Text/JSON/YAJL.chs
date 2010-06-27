@@ -292,7 +292,7 @@ newGenerator config = ST.unsafeIOToST $
 	allocaBytes {# sizeof yajl_gen_config #} $ \cConfig -> do
 		cIndent <- marshalText $ generatorIndent config
 	
-		{# set yajl_gen_config->beautify #} cConfig 0
+		{# set yajl_gen_config->beautify #} cConfig $ cFromBool $ generatorBeautify config
 		withForeignPtr cIndent $ {# set yajl_gen_config->indentString #} cConfig
 	
 		GenHandle handlePtr <- cGenAlloc (GenConfig cConfig) nullPtr
@@ -384,7 +384,7 @@ generate' g io = withGenerator g io >>= \rc -> case rc of
 	6 -> throwST NoBuffer
 	_ -> throwST $ UnknownError $ toInteger rc
 
-cFromBool :: Bool -> CInt
+cFromBool :: Integral a => Bool -> a
 cFromBool True = 1
 cFromBool False = 0
 
