@@ -48,14 +48,15 @@ module Text.JSON.YAJL
 	, generateEndObject
 	) where
 import qualified Control.Exception as E
+import qualified Control.Monad.ST as ST
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Unsafe as BU
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Typeable (Typeable)
+import qualified Data.STRef as ST
 import qualified Foreign.Concurrent as FC
-import qualified Data.IORef as I
 
 -- import unqualified for C2Hs
 import Foreign
@@ -64,25 +65,25 @@ import Foreign.C
 #include <yajl/yajl_parse.h>
 #include <yajl/yajl_gen.h>
 
-data Parser = Parser
+data Parser s = Parser
 	{ parserHandle :: ForeignPtr ParserHandle
 	, parserCallbacks :: ForeignPtr ()
-	, parserErrorRef :: I.IORef (Maybe E.SomeException)
+	, parserErrorRef :: ST.STRef s (Maybe E.SomeException)
 	}
 
 -- | Each callback should return 'True' to continue parsing, or 'False'
 -- to cancel.
 --
-data ParserCallbacks = ParserCallbacks
-	{ parsedNull :: IO Bool
-	, parsedBoolean :: Bool -> IO Bool
-	, parsedNumber :: B.ByteString -> IO Bool
-	, parsedText :: T.Text -> IO Bool
-	, parsedBeginArray :: IO Bool
-	, parsedEndArray :: IO Bool
-	, parsedBeginObject :: IO Bool
-	, parsedAttributeName :: T.Text -> IO Bool
-	, parsedEndObject :: IO Bool
+data ParserCallbacks s = ParserCallbacks
+	{ parsedNull :: ST.ST s Bool
+	, parsedBoolean :: Bool -> ST.ST s Bool
+	, parsedNumber :: B.ByteString -> ST.ST s Bool
+	, parsedText :: T.Text -> ST.ST s Bool
+	, parsedBeginArray :: ST.ST s Bool
+	, parsedEndArray :: ST.ST s Bool
+	, parsedBeginObject :: ST.ST s Bool
+	, parsedAttributeName :: T.Text -> ST.ST s Bool
+	, parsedEndObject :: ST.ST s Bool
 	}
 
 data ParseStatus
@@ -101,40 +102,41 @@ data ParseStatus
 
 {# pointer yajl_handle as ParserHandle newtype #}
 
-newParser :: ParserCallbacks -> IO Parser
+newParser :: ParserCallbacks s -> ST.ST s (Parser s)
 newParser callbacks = do
-	ref <- I.newIORef Nothing
-	cCallbacks <- mallocForeignPtrBytes {# sizeof yajl_callbacks #}
-	withForeignPtr cCallbacks $ \raw -> do
-		wrapCallback0 ref (parsedNull callbacks)
-			>>= {# set yajl_callbacks->yajl_null #} raw
-		wrapCallbackBool ref (parsedBoolean callbacks)
-			>>= {# set yajl_callbacks->yajl_boolean #} raw
-		wrapCallbackNum ref (parsedNumber callbacks)
-			>>= {# set yajl_callbacks->yajl_number #} raw
-		wrapCallbackText ref (parsedText callbacks)
-			>>= {# set yajl_callbacks->yajl_string #} raw
-		wrapCallback0 ref (parsedBeginObject callbacks)
-			>>= {# set yajl_callbacks->yajl_start_map #} raw
-		wrapCallbackText ref (parsedAttributeName callbacks)
-			>>= {# set yajl_callbacks->yajl_map_key #} raw
-		wrapCallback0 ref (parsedEndObject callbacks)
-			>>= {# set yajl_callbacks->yajl_end_map #} raw
-		wrapCallback0 ref (parsedBeginArray callbacks)
-			>>= {# set yajl_callbacks->yajl_start_array #} raw
-		wrapCallback0 ref (parsedEndArray callbacks)
-			>>= {# set yajl_callbacks->yajl_end_array #} raw
+	ref <- ST.newSTRef Nothing
+	ST.unsafeIOToST $ do
+		cCallbacks <- mallocForeignPtrBytes {# sizeof yajl_callbacks #}
+		withForeignPtr cCallbacks $ \raw -> do
+			wrapCallback0 ref (parsedNull callbacks)
+				>>= {# set yajl_callbacks->yajl_null #} raw
+			wrapCallbackBool ref (parsedBoolean callbacks)
+				>>= {# set yajl_callbacks->yajl_boolean #} raw
+			wrapCallbackNum ref (parsedNumber callbacks)
+				>>= {# set yajl_callbacks->yajl_number #} raw
+			wrapCallbackText ref (parsedText callbacks)
+				>>= {# set yajl_callbacks->yajl_string #} raw
+			wrapCallback0 ref (parsedBeginObject callbacks)
+				>>= {# set yajl_callbacks->yajl_start_map #} raw
+			wrapCallbackText ref (parsedAttributeName callbacks)
+				>>= {# set yajl_callbacks->yajl_map_key #} raw
+			wrapCallback0 ref (parsedEndObject callbacks)
+				>>= {# set yajl_callbacks->yajl_end_map #} raw
+			wrapCallback0 ref (parsedBeginArray callbacks)
+				>>= {# set yajl_callbacks->yajl_start_array #} raw
+			wrapCallback0 ref (parsedEndArray callbacks)
+				>>= {# set yajl_callbacks->yajl_end_array #} raw
+			
+			-- Unused
+			{# set yajl_callbacks->yajl_integer #} raw nullFunPtr
+			{# set yajl_callbacks->yajl_double #} raw nullFunPtr
+			
+			FC.addForeignPtrFinalizer cCallbacks $ freeParserCallbacks raw
 		
-		-- Unused
-		{# set yajl_callbacks->yajl_integer #} raw nullFunPtr
-		{# set yajl_callbacks->yajl_double #} raw nullFunPtr
-		
-		FC.addForeignPtrFinalizer cCallbacks $ freeParserCallbacks raw
-	
-	ParserHandle handlePtr <- withForeignPtr cCallbacks $ \ptr ->
-		{# call yajl_alloc #} ptr nullPtr nullPtr nullPtr
-	parserFP <- newForeignPtr cParserFree handlePtr
-	return $ Parser parserFP cCallbacks ref
+		ParserHandle handlePtr <- withForeignPtr cCallbacks $ \ptr ->
+			{# call yajl_alloc #} ptr nullPtr nullPtr nullPtr
+		parserFP <- newForeignPtr cParserFree handlePtr
+		return $ Parser parserFP cCallbacks ref
 
 freeParserCallbacks :: Ptr () -> IO ()
 freeParserCallbacks raw = do
@@ -157,27 +159,28 @@ type CallbackBool = Ptr () -> CInt -> IO CInt
 type CallbackNum = Ptr () -> Ptr CChar -> CUInt -> IO CInt
 type CallbackText = Ptr () -> Ptr CUChar -> CUInt -> IO CInt
 
-catchRef :: I.IORef (Maybe E.SomeException) -> IO Bool -> IO CInt
-catchRef ref io = do
-	continue <- E.catch io $ \e -> do
-		I.writeIORef ref $ Just e
+catchRef :: ST.STRef s (Maybe E.SomeException) -> ST.ST s Bool -> IO CInt
+catchRef ref st = do
+	continue <- E.catch (E.unblock (ST.unsafeSTToIO st)) $ \e -> do
+		ST.unsafeSTToIO $ ST.writeSTRef ref $ Just e
 		return False
 	return $ cFromBool continue
 
-wrapCallback0 :: I.IORef (Maybe E.SomeException) -> IO Bool -> IO (FunPtr Callback0)
-wrapCallback0 ref io = allocCallback0 $ \_ -> catchRef ref io
+wrapCallback0 :: ST.STRef s (Maybe E.SomeException) -> ST.ST s Bool -> IO (FunPtr Callback0)
+wrapCallback0 ref st = allocCallback0 $ \_ -> catchRef ref st
 
-wrapCallbackBool :: I.IORef (Maybe E.SomeException) -> (Bool -> IO Bool) -> IO (FunPtr CallbackBool)
-wrapCallbackBool ref io = allocCallbackBool $ \_ -> catchRef ref . io . cToBool
+wrapCallbackBool :: ST.STRef s (Maybe E.SomeException) -> (Bool -> ST.ST s Bool) -> IO (FunPtr CallbackBool)
+wrapCallbackBool ref st = allocCallbackBool $ \_ -> catchRef ref . st . cToBool
 
-wrapCallbackNum :: I.IORef (Maybe E.SomeException) -> (B.ByteString -> IO Bool) -> IO (FunPtr CallbackNum)
-wrapCallbackNum ref io = allocCallbackNum $ \_ cstr len -> catchRef ref $
-	B.packCStringLen (cstr, fromIntegral len) >>= io
+wrapCallbackNum :: ST.STRef s (Maybe E.SomeException) -> (B.ByteString -> ST.ST s Bool) -> IO (FunPtr CallbackNum)
+wrapCallbackNum ref st = allocCallbackNum $ \_ cstr len -> catchRef ref $ do
+	bytes <- ST.unsafeIOToST $ B.packCStringLen (cstr, fromIntegral len)
+	st bytes
 
-wrapCallbackText :: I.IORef (Maybe E.SomeException) -> (T.Text -> IO Bool) -> IO (FunPtr CallbackText)
-wrapCallbackText ref io = allocCallbackText $ \_ cstr len -> catchRef ref $ do
-	bytes <- BU.unsafePackCStringLen (castPtr cstr, fromIntegral len)
-	io (TE.decodeUtf8 bytes)
+wrapCallbackText :: ST.STRef s (Maybe E.SomeException) -> (T.Text -> ST.ST s Bool) -> IO (FunPtr CallbackText)
+wrapCallbackText ref st = allocCallbackText $ \_ cstr len -> catchRef ref $ do
+	bytes <- ST.unsafeIOToST $ BU.unsafePackCStringLen (castPtr cstr, fromIntegral len)
+	st (TE.decodeUtf8 bytes)
 
 foreign import ccall "wrapper"
 	allocCallback0 :: Callback0 -> IO (FunPtr Callback0)
@@ -191,31 +194,39 @@ foreign import ccall "wrapper"
 foreign import ccall "wrapper"
 	allocCallbackText :: CallbackText -> IO (FunPtr CallbackText)
 
-withParser :: Parser -> (ParserHandle -> IO a) -> IO a
-withParser p io = withForeignPtr (parserHandle p) $ io . ParserHandle
+withParser :: Parser s -> (ParserHandle -> IO a) -> ST.ST s a
+withParser p io = ST.unsafeIOToST $ withForeignPtr (parserHandle p) $ io . ParserHandle
 
-parseUTF8 :: Parser -> B.ByteString -> IO ParseStatus
-parseUTF8 p bytes =
-	withParser p $ \handle ->
+parseUTF8 :: Parser s -> B.ByteString -> ST.ST s ParseStatus
+parseUTF8 p bytes = parse' p $ \h ->
 	BU.unsafeUseAsCStringLen bytes $ \(cstr, len) ->
-	{# call yajl_parse #} handle (castPtr cstr) (fromIntegral len)
-	>>= checkParseStatus p
+	{# call yajl_parse #} h (castPtr cstr) (fromIntegral len)
 
-parseText :: Parser -> T.Text -> IO ParseStatus
-parseText p text =
-	withParser p $ \handle ->
+parseText :: Parser s -> T.Text -> ST.ST s ParseStatus
+parseText p text = parse' p $ \h ->
 	withUtf8 text $ \(utf8, len) ->
-	{# call yajl_parse #} handle utf8 len
-	>>= checkParseStatus p
+	{# call yajl_parse #} h utf8 len
 
 -- | Indicate that no more input is available, and parse any remaining
 -- buffered input.
 -- 
-parseComplete :: Parser -> IO ParseStatus
-parseComplete p =
-	withParser p $ \handle ->
-	{# call yajl_parse_complete #} handle
-	>>= checkParseStatus p
+parseComplete :: Parser s -> ST.ST s ParseStatus
+parseComplete p = parse' p {# call yajl_parse_complete #}
+
+parse' :: Parser s -> (ParserHandle -> IO CInt) -> ST.ST s ParseStatus
+parse' p io = do
+	ST.writeSTRef (parserErrorRef p) Nothing
+	rc <- blockST $ withParser p io
+	case rc of
+		0 -> return ParseFinished
+		1 -> do
+			threw <- ST.readSTRef $ parserErrorRef p
+			case threw of
+				Nothing -> return ParseCancelled
+				Just exc -> throwST exc
+		2 -> return ParseContinue
+		3 -> ParseError `fmap` getParseError p
+		_ -> return $ ParseError . T.pack $ "Unknown 'yajl_status': " ++ show rc
 
 -- | Get the number of bytes consumed from the last input chunk.
 -- 
@@ -229,32 +240,17 @@ parseComplete p =
 -- If the most recent parse returned 'ParseError', this will indicate where
 -- the error occured.
 -- 
-{# fun yajl_get_bytes_consumed as getBytesConsumed
-	{ withParser* `Parser'
-	} -> `Integer' toInteger #}
+getBytesConsumed :: Parser s -> ST.ST s Integer
+getBytesConsumed p = withParser p $ \h ->
+	toInteger `fmap` {# call yajl_get_bytes_consumed #} h
 
-{# enum yajl_status as RawParseStatus {underscoreToCase} #}
-
-checkParseStatus :: Parser -> CInt -> IO ParseStatus
-checkParseStatus p int = case toEnum $ fromIntegral int of
-	YajlStatusOk -> return ParseFinished
-	YajlStatusClientCanceled -> do
-		threw <- I.readIORef $ parserErrorRef p
-		case threw of
-			Nothing -> return ParseCancelled
-			Just exc -> do
-				I.writeIORef (parserErrorRef p) Nothing
-				E.throwIO exc
-	YajlStatusInsufficientData -> return ParseContinue
-	YajlStatusError -> ParseError `fmap` getParseError p
-
-getParseError :: Parser -> IO T.Text
-getParseError p = withParser p $ \handle -> E.bracket
-	({# call yajl_get_error #} handle 0 nullPtr 0)
-	({# call yajl_free_error #} handle)
+getParseError :: Parser s -> ST.ST s T.Text
+getParseError p = withParser p $ \h -> E.bracket
+	({# call yajl_get_error #} h 0 nullPtr 0)
+	({# call yajl_free_error #} h)
 	(\bytes -> T.pack `fmap` peekCString (castPtr bytes))
 
-data Generator = Generator
+data Generator s = Generator
 	{ genHandle :: ForeignPtr GenHandle
 	, genIndent :: ForeignPtr CChar
 	}
@@ -281,6 +277,7 @@ data GeneratorError
 	| GenerationComplete
 	| InvalidNumber
 	| NoBuffer
+	| UnknownError Integer
 	deriving (Show, Eq, Typeable)
 
 instance E.Exception GeneratorError
@@ -290,16 +287,17 @@ instance E.Exception GeneratorError
 
 -- | Create a new, empty generator with the given configuration.
 -- 
-newGenerator :: GeneratorConfig -> IO Generator
-newGenerator config = allocaBytes {# sizeof yajl_gen_config #} $ \cConfig -> do
-	cIndent <- marshalText $ generatorIndent config
+newGenerator :: GeneratorConfig -> ST.ST s (Generator s)
+newGenerator config = ST.unsafeIOToST $
+	allocaBytes {# sizeof yajl_gen_config #} $ \cConfig -> do
+		cIndent <- marshalText $ generatorIndent config
 	
-	{# set yajl_gen_config->beautify #} cConfig 0
-	withForeignPtr cIndent $ {# set yajl_gen_config->indentString #} cConfig
+		{# set yajl_gen_config->beautify #} cConfig 0
+		withForeignPtr cIndent $ {# set yajl_gen_config->indentString #} cConfig
 	
-	GenHandle handlePtr <- cGenAlloc (GenConfig cConfig) nullPtr
-	handleFP <- newForeignPtr cGenFree handlePtr
-	return $ Generator handleFP cIndent
+		GenHandle handlePtr <- cGenAlloc (GenConfig cConfig) nullPtr
+		handleFP <- newForeignPtr cGenFree handlePtr
+		return $ Generator handleFP cIndent
 
 marshalText :: T.Text -> IO (ForeignPtr CChar)
 marshalText text =
@@ -318,17 +316,17 @@ marshalText text =
 foreign import ccall "yajl/yajl_gen.h &yajl_gen_free"
 	cGenFree :: FunPtr (Ptr GenHandle -> IO ())
 
-withGenerator :: Generator -> (GenHandle -> IO a) -> IO a
-withGenerator gen io = withForeignPtr (genHandle gen) $ io . GenHandle
+withGenerator :: Generator s -> (GenHandle -> IO a) -> ST.ST s a
+withGenerator gen io = ST.unsafeIOToST $ withForeignPtr (genHandle gen) $ io . GenHandle
 
 -- | Retrieve the @NUL@-terminated byte buffer.
 -- 
-getBuffer :: Generator -> IO B.ByteString
+getBuffer :: Generator s -> ST.ST s B.ByteString
 getBuffer gen =
-	withGenerator gen $ \handle ->
+	withGenerator gen $ \h ->
 	alloca $ \bufPtr ->
 	alloca $ \lenPtr -> do
-	{# call yajl_gen_get_buf #} handle bufPtr lenPtr
+	{# call yajl_gen_get_buf #} h bufPtr lenPtr
 	buf <- peek bufPtr
 	len <- peek lenPtr
 	-- TODO: check that len is < (maxBound :: Int)
@@ -337,64 +335,54 @@ getBuffer gen =
 -- | Clear the generator's output buffer. This does not change the state
 -- of the generator.
 -- 
-{# fun yajl_gen_clear as clearBuffer
-	{ withGenerator* `Generator'
-	} -> `()' id #}
+clearBuffer :: Generator s -> ST.ST s ()
+clearBuffer g = withGenerator g {# call yajl_gen_clear #}
 
-{# fun yajl_gen_null as generateNull
-	{ withGenerator* `Generator'
-	} -> `()' checkGenStatus* #}
+generateNull :: Generator s -> ST.ST s ()
+generateNull g = generate' g {# call yajl_gen_null #}
 
-{# fun yajl_gen_bool as generateBoolean
-	{ withGenerator* `Generator'
-	, `Bool'
-	} -> `()' checkGenStatus* #}
+generateBoolean :: Generator s -> Bool -> ST.ST s ()
+generateBoolean g x = generate' g $ \h ->
+	{# call yajl_gen_bool #} h (cFromBool x)
 
-generateIntegral :: Integral a => Generator -> a -> IO ()
-generateIntegral gen = generateNumber gen . showBytes . toInteger
+generateIntegral :: Integral a => Generator s -> a -> ST.ST s ()
+generateIntegral g = generateNumber g . showBytes . toInteger
 
-generateDouble :: Generator -> Double -> IO ()
-generateDouble gen = generateNumber gen . showBytes
+generateDouble :: Generator s -> Double -> ST.ST s ()
+generateDouble g = generateNumber g . showBytes
 
-generateNumber :: Generator -> B.ByteString -> IO ()
-generateNumber gen bytes =
-	withGenerator gen $ \handle ->
+generateNumber :: Generator s -> B.ByteString -> ST.ST s ()
+generateNumber g bytes = generate' g $ \h ->
 	BU.unsafeUseAsCStringLen bytes $ \(cstr, len) ->
-	{# call yajl_gen_number #} handle (castPtr cstr) (fromIntegral len)
-	>>= checkGenStatus
+	{# call yajl_gen_number #} h (castPtr cstr) (fromIntegral len)
 
-{# fun yajl_gen_string as generateText
-	{ withGenerator* `Generator'
-	, withUtf8* `T.Text'&
-	} -> `()' checkGenStatus* #}
+generateText :: Generator s -> T.Text -> ST.ST s ()
+generateText g text = generate' g $ \h ->
+	withUtf8 text $ \(utf8, len) ->
+	{# call yajl_gen_string #} h utf8 len
 
-{# fun yajl_gen_array_open as generateBeginArray
-	{ withGenerator* `Generator'
-	} -> `()' checkGenStatus* #}
+generateBeginArray :: Generator s -> ST.ST s ()
+generateBeginArray g = generate' g {# call yajl_gen_array_open #}
 
-{# fun yajl_gen_array_close as generateEndArray
-	{ withGenerator* `Generator'
-	} -> `()' checkGenStatus* #}
+generateEndArray :: Generator s -> ST.ST s ()
+generateEndArray g = generate' g {# call yajl_gen_array_close #}
 
-{# fun yajl_gen_map_open as generateBeginObject
-	{ withGenerator* `Generator'
-	} -> `()' checkGenStatus* #}
+generateBeginObject :: Generator s -> ST.ST s ()
+generateBeginObject g = generate' g {# call yajl_gen_map_open #}
 
-{# fun yajl_gen_map_close as generateEndObject
-	{ withGenerator* `Generator'
-	} -> `()' checkGenStatus* #}
+generateEndObject :: Generator s -> ST.ST s ()
+generateEndObject g = generate' g {# call yajl_gen_map_close #}
 
-{# enum yajl_gen_status as GenStatus {underscoreToCase} #}
-
-checkGenStatus :: CInt -> IO ()
-checkGenStatus int = case toEnum $ fromIntegral int of
-	YajlGenStatusOk -> return ()
-	YajlGenKeysMustBeStrings -> E.throwIO InvalidAttributeName
-	YajlMaxDepthExceeded -> E.throwIO MaximumDepthExceeded
-	YajlGenInErrorState -> E.throwIO GeneratorInErrorState
-	YajlGenGenerationComplete -> E.throwIO GenerationComplete
-	YajlGenInvalidNumber -> E.throwIO InvalidNumber
-	YajlGenNoBuf -> E.throwIO NoBuffer
+generate' :: Generator s -> (GenHandle -> IO CInt) -> ST.ST s ()
+generate' g io = withGenerator g io >>= \rc -> case rc of
+	0 -> return ()
+	1 -> throwST InvalidAttributeName
+	2 -> throwST MaximumDepthExceeded
+	3 -> throwST GeneratorInErrorState
+	4 -> throwST GenerationComplete
+	5 -> throwST InvalidNumber
+	6 -> throwST NoBuffer
+	_ -> throwST $ UnknownError $ toInteger rc
 
 cFromBool :: Bool -> CInt
 cFromBool True = 1
@@ -413,3 +401,9 @@ withUtf8 text io =
 
 showBytes :: Show a => a -> B.ByteString
 showBytes = BC.pack . show
+
+throwST :: E.Exception e => e -> ST.ST s a
+throwST = ST.unsafeIOToST . E.throwIO
+
+blockST :: ST.ST s a -> ST.ST s a
+blockST = ST.unsafeIOToST . E.block . ST.unsafeSTToIO
