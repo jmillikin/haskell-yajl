@@ -15,15 +15,50 @@
 
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE RankNTypes #-}
 module Text.JSON.YAJL
 	(
 	-- * Parser
 	  Parser
-	, ParserCallbacks (..)
 	, ParseStatus (..)
-	, newParser
-	, parseUTF8
+	, newParserIO
+	, newParserST
+	
+	-- ** Parser callbacks
+	, Callback
+	, setCallback
+	, clearCallback
+	
+	-- *** Containers
+	, parsedBeginArray
+	, parsedEndArray
+	, parsedBeginObject
+	, parsedEndObject
+	
+	-- *** Basic values
+	, parsedNull
+	, parsedBoolean
+	
+	-- *** Numeric callbacks
+	, parsedInteger
+	, parsedDouble
+	, parsedNumber
+	
+	-- *** Text callbacks
+	, parsedAttributeText
+	, parsedAttributeBytes
+	, parsedAttributeBuffer
+	
+	, parsedText
+	, parsedBytes
+	, parsedBuffer
+	
+	-- ** Parser input
 	, parseText
+	, parseLazyText
+	, parseBytes
+	, parseLazyBytes
+	, parseBuffer
 	, parseComplete
 	, getBytesConsumed
 	
@@ -52,38 +87,30 @@ import qualified Control.Monad.ST as ST
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Unsafe as BU
 import qualified Data.ByteString.Char8 as BC
+import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import qualified Data.Text.Lazy as TL
 import Data.Typeable (Typeable)
-import qualified Data.STRef as ST
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Foreign.Concurrent as FC
 
 -- import unqualified for C2Hs
-import Foreign
+import Foreign hiding (free)
 import Foreign.C
 
 #include <yajl/yajl_parse.h>
 #include <yajl/yajl_gen.h>
+#include <string.h>
 
-data Parser s = Parser
+{# pointer yajl_handle as ParserHandle newtype #}
+
+data Parser m = Parser
 	{ parserHandle :: ForeignPtr ParserHandle
 	, parserCallbacks :: ForeignPtr ()
-	, parserErrorRef :: ST.STRef s (Maybe E.SomeException)
-	}
-
--- | Each callback should return 'True' to continue parsing, or 'False'
--- to cancel.
---
-data ParserCallbacks s = ParserCallbacks
-	{ parsedNull :: ST.ST s Bool
-	, parsedBoolean :: Bool -> ST.ST s Bool
-	, parsedNumber :: B.ByteString -> ST.ST s Bool
-	, parsedText :: T.Text -> ST.ST s Bool
-	, parsedBeginArray :: ST.ST s Bool
-	, parsedEndArray :: ST.ST s Bool
-	, parsedBeginObject :: ST.ST s Bool
-	, parsedAttributeName :: T.Text -> ST.ST s Bool
-	, parsedEndObject :: ST.ST s Bool
+	, parserErrorRef :: IORef (Maybe E.SomeException)
+	, parserToIO :: forall a. m a -> IO a
+	, parserFromIO :: forall a. IO a -> m a
 	}
 
 data ParseStatus
@@ -100,43 +127,27 @@ data ParseStatus
 	
 	deriving (Show, Eq)
 
-{# pointer yajl_handle as ParserHandle newtype #}
-
-newParser :: ParserCallbacks s -> ST.ST s (Parser s)
-newParser callbacks = do
-	ref <- ST.newSTRef Nothing
-	ST.unsafeIOToST $ do
-		cCallbacks <- mallocForeignPtrBytes {# sizeof yajl_callbacks #}
-		withForeignPtr cCallbacks $ \raw -> do
-			wrapCallback0 ref (parsedNull callbacks)
-				>>= {# set yajl_callbacks->yajl_null #} raw
-			wrapCallbackBool ref (parsedBoolean callbacks)
-				>>= {# set yajl_callbacks->yajl_boolean #} raw
-			wrapCallbackNum ref (parsedNumber callbacks)
-				>>= {# set yajl_callbacks->yajl_number #} raw
-			wrapCallbackText ref (parsedText callbacks)
-				>>= {# set yajl_callbacks->yajl_string #} raw
-			wrapCallback0 ref (parsedBeginObject callbacks)
-				>>= {# set yajl_callbacks->yajl_start_map #} raw
-			wrapCallbackText ref (parsedAttributeName callbacks)
-				>>= {# set yajl_callbacks->yajl_map_key #} raw
-			wrapCallback0 ref (parsedEndObject callbacks)
-				>>= {# set yajl_callbacks->yajl_end_map #} raw
-			wrapCallback0 ref (parsedBeginArray callbacks)
-				>>= {# set yajl_callbacks->yajl_start_array #} raw
-			wrapCallback0 ref (parsedEndArray callbacks)
-				>>= {# set yajl_callbacks->yajl_end_array #} raw
-			
-			-- Unused
-			{# set yajl_callbacks->yajl_integer #} raw nullFunPtr
-			{# set yajl_callbacks->yajl_double #} raw nullFunPtr
-			
-			FC.addForeignPtrFinalizer cCallbacks $ freeParserCallbacks raw
+newParserIO :: IO (Parser IO)
+newParserIO = E.block $ do
+	ref <- newIORef Nothing
+	cCallbacks <- mallocForeignPtrBytes {# sizeof yajl_callbacks #}
+	ParserHandle handlePtr <- withForeignPtr cCallbacks $ \raw -> do
+		{# call memset #} raw 0 {# sizeof yajl_callbacks #}
+		FC.addForeignPtrFinalizer cCallbacks $ freeParserCallbacks raw
 		
-		ParserHandle handlePtr <- withForeignPtr cCallbacks $ \ptr ->
-			{# call yajl_alloc #} ptr nullPtr nullPtr nullPtr
-		parserFP <- newForeignPtr cParserFree handlePtr
-		return $ Parser parserFP cCallbacks ref
+		-- TODO: set checkUTF8 flag
+		
+		{# call yajl_alloc #} raw nullPtr nullPtr nullPtr
+	parserFP <- newForeignPtr cParserFree handlePtr
+	return $ Parser parserFP cCallbacks ref id id
+
+newParserST :: ST.ST s (Parser (ST.ST s))
+newParserST = ST.unsafeIOToST $ do
+	p <- newParserIO
+	return $ p
+		{ parserToIO = ST.unsafeSTToIO
+		, parserFromIO = ST.unsafeIOToST
+		}
 
 freeParserCallbacks :: Ptr () -> IO ()
 freeParserCallbacks raw = do
@@ -153,34 +164,69 @@ freeParserCallbacks raw = do
 foreign import ccall "yajl/yajl_parse.h &yajl_free"
 	cParserFree :: FunPtr (Ptr ParserHandle -> IO ())
 
+-- | A callback should return 'True' to continue parsing, or 'False'
+-- to cancel.
+--
+data Callback m a = Callback
+	{ callbackSet :: Parser m -> a -> IO ()
+	, callbackClear :: Parser m -> IO ()
+	}
+
+setCallback :: Parser m -> Callback m a -> a -> m ()
+setCallback p cb io = parserFromIO p $ callbackSet cb p io
+
+clearCallback :: Parser m -> Callback m a -> m ()
+clearCallback p cb = parserFromIO p $callbackClear cb p
+
 -- Callback wrappers
 type Callback0 = Ptr () -> IO CInt
 type CallbackBool = Ptr () -> CInt -> IO CInt
-type CallbackNum = Ptr () -> Ptr CChar -> CUInt -> IO CInt
-type CallbackText = Ptr () -> Ptr CUChar -> CUInt -> IO CInt
+type CallbackLong = Ptr () -> CLong -> IO CInt
+type CallbackDouble = Ptr () -> CDouble -> IO CInt
+type CallbackBuf = Ptr () -> Ptr CChar -> CUInt -> IO CInt
+type CallbackUBuf = Ptr () -> Ptr CUChar -> CUInt -> IO CInt
 
-catchRef :: ST.STRef s (Maybe E.SomeException) -> ST.ST s Bool -> IO CInt
-catchRef ref st = do
-	continue <- E.catch (E.unblock (ST.unsafeSTToIO st)) $ \e -> do
-		ST.unsafeSTToIO $ ST.writeSTRef ref $ Just e
+catchRef :: Parser m -> m Bool -> IO CInt
+catchRef p io = do
+	continue <- E.catch (E.unblock (parserToIO p io)) $ \e -> do
+		writeIORef (parserErrorRef p) $ Just e
 		return False
 	return $ cFromBool continue
 
-wrapCallback0 :: ST.STRef s (Maybe E.SomeException) -> ST.ST s Bool -> IO (FunPtr Callback0)
-wrapCallback0 ref st = allocCallback0 $ \_ -> catchRef ref st
+wrapCallback0 :: Parser m -> m Bool -> IO (FunPtr Callback0)
+wrapCallback0 p io = allocCallback0 $ \_ -> catchRef p io
 
-wrapCallbackBool :: ST.STRef s (Maybe E.SomeException) -> (Bool -> ST.ST s Bool) -> IO (FunPtr CallbackBool)
-wrapCallbackBool ref st = allocCallbackBool $ \_ -> catchRef ref . st . cToBool
+wrapCallbackBool :: Parser m -> (Bool -> m Bool) -> IO (FunPtr CallbackBool)
+wrapCallbackBool p io = allocCallbackBool $ \_ -> catchRef p . io . cToBool
 
-wrapCallbackNum :: ST.STRef s (Maybe E.SomeException) -> (B.ByteString -> ST.ST s Bool) -> IO (FunPtr CallbackNum)
-wrapCallbackNum ref st = allocCallbackNum $ \_ cstr len -> catchRef ref $ do
-	bytes <- ST.unsafeIOToST $ B.packCStringLen (cstr, fromIntegral len)
-	st bytes
+wrapCallbackLong :: Parser m -> (Integer -> m Bool) -> IO (FunPtr CallbackLong)
+wrapCallbackLong p io = allocCallbackLong $ \_ -> catchRef p . io . toInteger
 
-wrapCallbackText :: ST.STRef s (Maybe E.SomeException) -> (T.Text -> ST.ST s Bool) -> IO (FunPtr CallbackText)
-wrapCallbackText ref st = allocCallbackText $ \_ cstr len -> catchRef ref $ do
-	bytes <- ST.unsafeIOToST $ BU.unsafePackCStringLen (castPtr cstr, fromIntegral len)
-	st (TE.decodeUtf8 bytes)
+wrapCallbackDouble :: Parser m -> (Double -> m Bool) -> IO (FunPtr CallbackDouble)
+wrapCallbackDouble p io = allocCallbackDouble $ \_ -> catchRef p . io . realToFrac
+
+wrapCallbackText :: Parser m -> (T.Text -> m Bool) -> IO (FunPtr CallbackUBuf)
+wrapCallbackText p cb = wrapCallbackBytes p (cb . TE.decodeUtf8)
+
+wrapCallbackBytes' :: Parser m -> (B.ByteString -> m Bool) -> IO (FunPtr CallbackBuf)
+wrapCallbackBytes' p io =
+	allocCallbackBuf $ \_ cstr len ->
+	catchRef p $ parserFromIO p $ do
+		bytes <- B.packCStringLen (castPtr cstr, fromIntegral len)
+		parserToIO p $ io bytes
+
+wrapCallbackBytes :: Parser m -> (B.ByteString -> m Bool) -> IO (FunPtr CallbackUBuf)
+wrapCallbackBytes p io =
+	allocCallbackUBuf $ \_ cstr len ->
+	catchRef p $ parserFromIO p $ do
+		bytes <- B.packCStringLen (castPtr cstr, fromIntegral len)
+		parserToIO p $ io bytes
+
+wrapCallbackBuffer :: Parser m -> ((Ptr Word8, Integer) -> m Bool) -> IO (FunPtr CallbackUBuf)
+wrapCallbackBuffer p io =
+	allocCallbackUBuf $ \_ cstr len ->
+	catchRef p $
+	io (castPtr cstr, toInteger len)
 
 foreign import ccall "wrapper"
 	allocCallback0 :: Callback0 -> IO (FunPtr Callback0)
@@ -189,64 +235,206 @@ foreign import ccall "wrapper"
 	allocCallbackBool :: CallbackBool -> IO (FunPtr CallbackBool)
 
 foreign import ccall "wrapper"
-	allocCallbackNum :: CallbackNum -> IO (FunPtr CallbackNum)
+	allocCallbackLong :: CallbackLong -> IO (FunPtr CallbackLong)
 
 foreign import ccall "wrapper"
-	allocCallbackText :: CallbackText -> IO (FunPtr CallbackText)
+	allocCallbackDouble :: CallbackDouble -> IO (FunPtr CallbackDouble)
 
-withParser :: Parser s -> (ParserHandle -> IO a) -> ST.ST s a
-withParser p io = ST.unsafeIOToST $ withForeignPtr (parserHandle p) $ io . ParserHandle
+foreign import ccall "wrapper"
+	allocCallbackBuf :: CallbackBuf -> IO (FunPtr CallbackBuf)
 
-parseUTF8 :: Parser s -> B.ByteString -> ST.ST s ParseStatus
-parseUTF8 p bytes = parse' p $ \h ->
-	BU.unsafeUseAsCStringLen bytes $ \(cstr, len) ->
-	{# call yajl_parse #} h (castPtr cstr) (fromIntegral len)
+foreign import ccall "wrapper"
+	allocCallbackUBuf :: CallbackUBuf -> IO (FunPtr CallbackUBuf)
 
-parseText :: Parser s -> T.Text -> ST.ST s ParseStatus
-parseText p text = parse' p $ \h ->
-	withUtf8 text $ \(utf8, len) ->
-	{# call yajl_parse #} h utf8 len
+callback :: (Parser m -> a -> IO (FunPtr b))
+         -> (Ptr () -> IO (FunPtr b))
+         -> (Ptr () -> FunPtr b -> IO ())
+         -> Callback m a
+callback wrap getPtr setPtr = Callback set clear where
+	set parser io = withForeignPtr (parserCallbacks parser) $ \p -> do
+		free p
+		wrap parser io >>= setPtr p
+	clear parser = withForeignPtr (parserCallbacks parser) $ \p -> do
+		free p
+		setPtr p nullFunPtr
+	free p = do
+		cb <- getPtr p
+		if cb == nullFunPtr
+			then return ()
+			else freeHaskellFunPtr cb
 
--- | Indicate that no more input is available, and parse any remaining
--- buffered input.
--- 
-parseComplete :: Parser s -> ST.ST s ParseStatus
-parseComplete p = parse' p {# call yajl_parse_complete #}
+parsedBeginArray :: Callback m (m Bool)
+parsedBeginArray = callback wrapCallback0
+	{# get yajl_callbacks->yajl_start_array #}
+	{# set yajl_callbacks->yajl_start_array #}
 
-parse' :: Parser s -> (ParserHandle -> IO CInt) -> ST.ST s ParseStatus
-parse' p io = do
-	ST.writeSTRef (parserErrorRef p) Nothing
-	rc <- blockST $ withParser p io
-	ST.unsafeIOToST $ touchForeignPtr $ parserCallbacks p
-	case rc of
-		0 -> return ParseFinished
-		1 -> do
-			threw <- ST.readSTRef $ parserErrorRef p
-			case threw of
-				Nothing -> return ParseCancelled
-				Just exc -> throwST exc
-		2 -> return ParseContinue
-		3 -> ParseError `fmap` getParseError p
-		_ -> return $ ParseError . T.pack $ "Unknown 'yajl_status': " ++ show rc
+parsedEndArray :: Callback m (m Bool)
+parsedEndArray = callback wrapCallback0
+	{# get yajl_callbacks->yajl_end_array #}
+	{# set yajl_callbacks->yajl_end_array #}
+
+parsedBeginObject :: Callback m (m Bool)
+parsedBeginObject = callback wrapCallback0
+	{# get yajl_callbacks->yajl_start_map #}
+	{# set yajl_callbacks->yajl_start_map #}
+
+parsedEndObject :: Callback m (m Bool)
+parsedEndObject = callback wrapCallback0
+	{# get yajl_callbacks->yajl_end_map #}
+	{# set yajl_callbacks->yajl_end_map #}
+
+parsedNull :: Callback m (m Bool)
+parsedNull = callback wrapCallback0
+	{# get yajl_callbacks->yajl_null #}
+	{# set yajl_callbacks->yajl_null #}
+
+parsedBoolean :: Callback m (Bool -> m Bool)
+parsedBoolean = callback wrapCallbackBool
+	{# get yajl_callbacks->yajl_boolean #}
+	{# set yajl_callbacks->yajl_boolean #}
+
+parsedInteger :: Callback m (Integer -> m Bool)
+parsedInteger = callback wrapCallbackLong
+	{# get yajl_callbacks->yajl_integer #}
+	{# set yajl_callbacks->yajl_integer #}
+
+parsedDouble :: Callback m (Double -> m Bool)
+parsedDouble = callback wrapCallbackDouble
+	{# get yajl_callbacks->yajl_double #}
+	{# set yajl_callbacks->yajl_double #}
+
+-- | If 'parsedNumber' is set, it overrides 'parsedInteger' and 'parsedDouble'.
+-- Registered functions for these callbacks will not receive any input until
+-- 'parsedNumber' is unset.
+--
+-- If 'parsedNumber' is not set, but one of 'parsedInteger' or 'parsedDouble'
+-- is set, then any values which cannot be represented by 'CLong' or 'CDouble'
+-- will cause a parse error.
+--
+-- The 'B.ByteString' is in UTF8.
+parsedNumber :: Callback m (B.ByteString -> m Bool)
+parsedNumber = callback wrapCallbackBytes'
+	{# get yajl_callbacks->yajl_number #}
+	{# set yajl_callbacks->yajl_number #}
+
+-- | Only one of 'parsedAttributeText', 'parsedAttributeBytes', or
+-- 'parsedAttributeBuffer' may be set. If another of these callbacks is set,
+-- it will unset the others.
+parsedAttributeText :: Callback m (T.Text -> m Bool)
+parsedAttributeText = callback wrapCallbackText
+	{# get yajl_callbacks->yajl_map_key #}
+	{# set yajl_callbacks->yajl_map_key #}
+
+-- | Only one of 'parsedAttributeText', 'parsedAttributeBytes', or
+-- 'parsedAttributeBuffer' may be set. If another of these callbacks is set,
+-- it will unset the others.
+--
+-- The 'B.ByteString' is in UTF8.
+parsedAttributeBytes :: Callback m (B.ByteString -> m Bool)
+parsedAttributeBytes = callback wrapCallbackBytes
+	{# get yajl_callbacks->yajl_map_key #}
+	{# set yajl_callbacks->yajl_map_key #}
+
+-- | Only one of 'parsedAttributeText', 'parsedAttributeBytes', or
+-- 'parsedAttributeBuffer' may be set. If another of these callbacks is set,
+-- it will unset the others.
+--
+-- The buffer is in UTF8.
+parsedAttributeBuffer :: Callback m ((Ptr Word8, Integer) -> m Bool)
+parsedAttributeBuffer = callback wrapCallbackBuffer
+	{# get yajl_callbacks->yajl_map_key #}
+	{# set yajl_callbacks->yajl_map_key #}
+
+-- | Only one of 'parsedText', 'parsedBytes', or 'parsedBuffer' may be set.
+-- If another of these callbacks is set, it will unset the others.
+parsedText :: Callback m (T.Text -> m Bool)
+parsedText = callback wrapCallbackText
+	{# get yajl_callbacks->yajl_string #}
+	{# set yajl_callbacks->yajl_string #}
+
+-- | Only one of 'parsedText', 'parsedBytes', or 'parsedBuffer' may be set.
+-- If another of these callbacks is set, it will unset the others.
+--
+-- The 'B.ByteString' is in UTF8.
+parsedBytes :: Callback m (B.ByteString -> m Bool)
+parsedBytes = callback wrapCallbackBytes
+	{# get yajl_callbacks->yajl_string #}
+	{# set yajl_callbacks->yajl_string #}
+
+-- | Only one of 'parsedText', 'parsedBytes', or 'parsedBuffer' may be set.
+-- If another of these callbacks is set, it will unset the others.
+--
+-- The buffer is in UTF8.
+parsedBuffer :: Callback m ((Ptr Word8, Integer) -> m Bool)
+parsedBuffer = callback wrapCallbackBuffer
+	{# get yajl_callbacks->yajl_string #}
+	{# set yajl_callbacks->yajl_string #}
+
+withParser :: Parser m -> (ParserHandle -> IO a) -> m a
+withParser p io = parserFromIO p $ withParserIO p io
+
+withParserIO :: Parser m -> (ParserHandle -> IO a) -> IO a
+withParserIO p io = withForeignPtr (parserHandle p) $ io . ParserHandle
 
 -- | Get the number of bytes consumed from the last input chunk.
 -- 
 -- Note that if using 'parseText', this corresponds to UTF-8 bytes,
 -- /not/ characters.
 -- 
--- If the most recent call to 'parseUTF8' or 'parseText' returned
+-- If the most recent call to 'parseBytes', 'parseText', etc, returned
 -- 'ParseFinished', this will indicate whether there are any un-parsed
 -- bytes past the end of input.
 -- 
 -- If the most recent parse returned 'ParseError', this will indicate where
 -- the error occured.
 -- 
-getBytesConsumed :: Parser s -> ST.ST s Integer
+getBytesConsumed :: Parser m -> m Integer
 getBytesConsumed p = withParser p $ \h ->
 	toInteger `fmap` {# call yajl_get_bytes_consumed #} h
 
-getParseError :: Parser s -> ST.ST s T.Text
-getParseError p = withParser p $ \h -> E.bracket
+parseImpl :: Parser m -> (ParserHandle -> IO CInt) -> m ParseStatus
+parseImpl p io = parserFromIO p $ do
+	writeIORef (parserErrorRef p) Nothing
+	rc <- E.block $ withParserIO p io
+	touchForeignPtr $ parserCallbacks p
+	case rc of
+		0 -> return ParseFinished
+		1 -> do
+			threw <- readIORef $ parserErrorRef p
+			case threw of
+				Nothing -> return ParseCancelled
+				Just exc -> E.throwIO exc
+		2 -> return ParseContinue
+		3 -> ParseError `fmap` getParseError p
+		_ -> return $ ParseError . T.pack $ "Unknown 'yajl_status': " ++ show rc
+
+parseText :: Parser m -> T.Text -> m ParseStatus
+parseText p = parseBytes p . TE.encodeUtf8
+
+parseLazyText :: Parser m -> TL.Text -> m ParseStatus
+parseLazyText p = parseText p . T.concat . TL.toChunks
+
+-- | The input must be in UTF8
+parseBytes :: Parser m -> B.ByteString -> m ParseStatus
+parseBytes p bytes = parseImpl p $ \h ->
+	BU.unsafeUseAsCStringLen bytes $ \(cstr, len) ->
+	{# call yajl_parse #} h (castPtr cstr) (fromIntegral len)
+
+-- | The input must be in UTF8
+parseLazyBytes :: Parser m -> BL.ByteString -> m ParseStatus
+parseLazyBytes p = parseBytes p . B.concat . BL.toChunks
+
+-- | The input must be in UTF8
+parseBuffer :: Parser m -> (Ptr Word8, Integer) -> m ParseStatus
+parseBuffer p (ptr, len) = parseImpl p $ \h ->
+	{# call yajl_parse #} h (castPtr ptr) (fromIntegral len)
+
+-- | Called when no more input is available
+parseComplete :: Parser m -> m ParseStatus
+parseComplete p = parseImpl p {# call yajl_parse_complete #}
+
+getParseError :: Parser m -> IO T.Text
+getParseError p = withParserIO p $ \h -> E.bracket
 	({# call yajl_get_error #} h 0 nullPtr 0)
 	({# call yajl_free_error #} h)
 	(\bytes -> T.pack `fmap` peekCString (castPtr bytes))
@@ -405,6 +593,3 @@ showBytes = BC.pack . show
 
 throwST :: E.Exception e => e -> ST.ST s a
 throwST = ST.unsafeIOToST . E.throwIO
-
-blockST :: ST.ST s a -> ST.ST s a
-blockST = ST.unsafeIOToST . E.block . ST.unsafeSTToIO
