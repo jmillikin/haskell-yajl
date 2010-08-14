@@ -167,16 +167,13 @@ foreign import ccall "yajl/yajl_parse.h &yajl_free"
 -- | A callback should return 'True' to continue parsing, or 'False'
 -- to cancel.
 --
-data Callback m a = Callback
-	{ callbackSet :: Parser m -> a -> IO ()
-	, callbackClear :: Parser m -> IO ()
-	}
+data Callback m a = Callback (Parser m -> a -> IO ()) (Parser m -> IO ())
 
 setCallback :: Parser m -> Callback m a -> a -> m ()
-setCallback p cb io = parserFromIO p $ callbackSet cb p io
+setCallback p (Callback set _) io = parserFromIO p $ set p io
 
 clearCallback :: Parser m -> Callback m a -> m ()
-clearCallback p cb = parserFromIO p $callbackClear cb p
+clearCallback p (Callback _ clear) = parserFromIO p $ clear p
 
 -- Callback wrappers
 type Callback0 = Ptr () -> IO CInt
