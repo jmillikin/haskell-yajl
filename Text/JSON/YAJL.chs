@@ -308,7 +308,7 @@ parsedDouble = callback wrapCallbackDouble
 -- is set, then any values which cannot be represented by 'CLong' or 'CDouble'
 -- will cause a parse error.
 --
--- The 'B.ByteString' is in UTF8.
+-- The 'B.ByteString' is in UTF-8.
 parsedNumber :: Callback m (B.ByteString -> m Bool)
 parsedNumber = callback wrapCallbackBytes'
 	{# get yajl_callbacks->yajl_number #}
@@ -326,7 +326,7 @@ parsedAttributeText = callback wrapCallbackText
 -- 'parsedAttributeBuffer' may be set. If another of these callbacks is set,
 -- it will unset the others.
 --
--- The 'B.ByteString' is in UTF8.
+-- The 'B.ByteString' is in UTF-8.
 parsedAttributeBytes :: Callback m (B.ByteString -> m Bool)
 parsedAttributeBytes = callback wrapCallbackBytes
 	{# get yajl_callbacks->yajl_map_key #}
@@ -336,7 +336,7 @@ parsedAttributeBytes = callback wrapCallbackBytes
 -- 'parsedAttributeBuffer' may be set. If another of these callbacks is set,
 -- it will unset the others.
 --
--- The buffer is in UTF8.
+-- The buffer is in UTF-8.
 parsedAttributeBuffer :: Callback m ((Ptr Word8, Integer) -> m Bool)
 parsedAttributeBuffer = callback wrapCallbackBuffer
 	{# get yajl_callbacks->yajl_map_key #}
@@ -352,7 +352,7 @@ parsedText = callback wrapCallbackText
 -- | Only one of 'parsedText', 'parsedBytes', or 'parsedBuffer' may be set.
 -- If another of these callbacks is set, it will unset the others.
 --
--- The 'B.ByteString' is in UTF8.
+-- The 'B.ByteString' is in UTF-8.
 parsedBytes :: Callback m (B.ByteString -> m Bool)
 parsedBytes = callback wrapCallbackBytes
 	{# get yajl_callbacks->yajl_string #}
@@ -361,7 +361,7 @@ parsedBytes = callback wrapCallbackBytes
 -- | Only one of 'parsedText', 'parsedBytes', or 'parsedBuffer' may be set.
 -- If another of these callbacks is set, it will unset the others.
 --
--- The buffer is in UTF8.
+-- The buffer is in UTF-8.
 parsedBuffer :: Callback m ((Ptr Word8, Integer) -> m Bool)
 parsedBuffer = callback wrapCallbackBuffer
 	{# get yajl_callbacks->yajl_string #}
@@ -375,8 +375,8 @@ withParserIO p io = withForeignPtr (parserHandle p) $ io . ParserHandle
 
 -- | Get the number of bytes consumed from the last input chunk.
 -- 
--- Note that if using 'parseText', this corresponds to UTF-8 bytes,
--- /not/ characters.
+-- Note that if using 'parseText' or 'parseLazyText', this corresponds to
+-- UTF-8 bytes, /not/ characters.
 -- 
 -- If the most recent call to 'parseBytes', 'parseText', etc, returned
 -- 'ParseFinished', this will indicate whether there are any un-parsed
@@ -411,22 +411,23 @@ parseText p = parseBytes p . TE.encodeUtf8
 parseLazyText :: Parser m -> TL.Text -> m ParseStatus
 parseLazyText p = parseText p . T.concat . TL.toChunks
 
--- | The input must be in UTF8
+-- | The input must be in UTF-8.
 parseBytes :: Parser m -> B.ByteString -> m ParseStatus
 parseBytes p bytes = parseImpl p $ \h ->
 	BU.unsafeUseAsCStringLen bytes $ \(cstr, len) ->
 	{# call yajl_parse #} h (castPtr cstr) (fromIntegral len)
 
--- | The input must be in UTF8
+-- | The input must be in UTF-8.
 parseLazyBytes :: Parser m -> BL.ByteString -> m ParseStatus
 parseLazyBytes p = parseBytes p . B.concat . BL.toChunks
 
--- | The input must be in UTF8
+-- | The input must be in UTF-8.
 parseBuffer :: Parser m -> (Ptr Word8, Integer) -> m ParseStatus
 parseBuffer p (ptr, len) = parseImpl p $ \h ->
 	{# call yajl_parse #} h (castPtr ptr) (fromIntegral len)
 
--- | Called when no more input is available
+-- | Clients should call this when no more input is available, to indicate
+-- EOF.
 parseComplete :: Parser m -> m ParseStatus
 parseComplete p = parseImpl p {# call yajl_parse_complete #}
 
