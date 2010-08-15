@@ -151,15 +151,15 @@ newParserST = ST.unsafeIOToST $ do
 
 freeParserCallbacks :: Ptr () -> IO ()
 freeParserCallbacks raw = do
-	{# get yajl_callbacks->yajl_null #} raw >>= freeHaskellFunPtr
-	{# get yajl_callbacks->yajl_boolean #} raw >>= freeHaskellFunPtr
-	{# get yajl_callbacks->yajl_number #} raw >>= freeHaskellFunPtr
-	{# get yajl_callbacks->yajl_string #} raw >>= freeHaskellFunPtr
-	{# get yajl_callbacks->yajl_start_map #} raw >>= freeHaskellFunPtr
-	{# get yajl_callbacks->yajl_map_key #} raw >>= freeHaskellFunPtr
-	{# get yajl_callbacks->yajl_end_map #} raw >>= freeHaskellFunPtr
-	{# get yajl_callbacks->yajl_start_array #} raw >>= freeHaskellFunPtr
-	{# get yajl_callbacks->yajl_end_array #} raw >>= freeHaskellFunPtr
+	{# get yajl_callbacks->yajl_null #} raw >>= freeFunPtr
+	{# get yajl_callbacks->yajl_boolean #} raw >>= freeFunPtr
+	{# get yajl_callbacks->yajl_number #} raw >>= freeFunPtr
+	{# get yajl_callbacks->yajl_string #} raw >>= freeFunPtr
+	{# get yajl_callbacks->yajl_start_map #} raw >>= freeFunPtr
+	{# get yajl_callbacks->yajl_map_key #} raw >>= freeFunPtr
+	{# get yajl_callbacks->yajl_end_map #} raw >>= freeFunPtr
+	{# get yajl_callbacks->yajl_start_array #} raw >>= freeFunPtr
+	{# get yajl_callbacks->yajl_end_array #} raw >>= freeFunPtr
 
 foreign import ccall "yajl/yajl_parse.h &yajl_free"
 	cParserFree :: FunPtr (Ptr ParserHandle -> IO ())
@@ -243,6 +243,11 @@ foreign import ccall "wrapper"
 foreign import ccall "wrapper"
 	allocCallbackUBuf :: CallbackUBuf -> IO (FunPtr CallbackUBuf)
 
+freeFunPtr :: FunPtr a -> IO ()
+freeFunPtr ptr = if ptr == nullFunPtr
+	then return ()
+	else freeHaskellFunPtr ptr
+
 callback :: (Parser m -> a -> IO (FunPtr b))
          -> (Ptr () -> IO (FunPtr b))
          -> (Ptr () -> FunPtr b -> IO ())
@@ -254,11 +259,7 @@ callback wrap getPtr setPtr = Callback set clear where
 	clear parser = withForeignPtr (parserCallbacks parser) $ \p -> do
 		free p
 		setPtr p nullFunPtr
-	free p = do
-		cb <- getPtr p
-		if cb == nullFunPtr
-			then return ()
-			else freeHaskellFunPtr cb
+	free p = getPtr p >>= freeFunPtr
 
 parsedBeginArray :: Callback m (m Bool)
 parsedBeginArray = callback wrapCallback0
