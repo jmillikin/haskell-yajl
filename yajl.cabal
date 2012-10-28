@@ -1,32 +1,34 @@
 name: yajl
 version: 0.3.0.5
-synopsis: Bindings for YAJL, an event-based JSON implementation
 license: GPL-3
 license-file: license.txt
 author: John Millikin <jmillikin@gmail.com>
-maintainer: jmillikin@gmail.com
-copyright: Copyright (c) John Millikin 2010
+maintainer: John Millikin <jmillikin@gmail.com>
 build-type: Simple
-cabal-version: >=1.6
+cabal-version: >= 1.6
 category: Foreign, Codec
 stability: experimental
+homepage: https://john-millikin.com/software/haskell-yajl/
 bug-reports: mailto:jmillikin@gmail.com
-homepage: http://john-millikin.com/software/bindings/yajl/
-tested-with: GHC==6.12.1
+
+synopsis: Bindings for YAJL, an event-based JSON implementation
+description:
 
 source-repository head
   type: bazaar
-  location: http://john-millikin.com/software/bindings/yajl/
+  location: https://john-millikin.com/branches/haskell-yajl/0.3/
+
+source-repository this
+  type: bazaar
+  location: https://john-millikin.com/branches/haskell-yajl/0.3/
+  tag: haskell-yajl_0.3.0.5
 
 library
-  if true
-    ghc-options: -Wall
-
-  if impl(ghc >= 6.11)
-    ghc-options: -fno-warn-unused-do-bind
+  ghc-options: -Wall -O2
+  hs-source-dirs: lib
 
   build-depends:
-      base >= 4 && < 5
+      base >= 4.0 && < 5.0
     , bytestring >= 0.9 && < 0.10
     , text >= 0.7 && < 0.12
 
